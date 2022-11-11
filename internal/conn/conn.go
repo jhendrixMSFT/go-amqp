@@ -397,7 +397,7 @@ func (c *Conn) NewSession(opts *session.SessionOptions) (*session.Session, error
 		return nil, fmt.Errorf("reached connection channel max (%d)", c.channelMax)
 	}
 	session := session.New(c, uint16(channel), opts)
-	c.sessionsByChannel[session.channel] = session
+	c.sessionsByChannel[session.Channel()] = session
 	return session, nil
 }
 
@@ -405,8 +405,8 @@ func (c *Conn) DeleteSession(s *session.Session) {
 	c.sessionsByChannelMu.Lock()
 	defer c.sessionsByChannelMu.Unlock()
 
-	delete(c.sessionsByChannel, s.channel)
-	c.channels.Remove(uint32(s.channel))
+	delete(c.sessionsByChannel, s.Channel())
+	c.channels.Remove(uint32(s.Channel()))
 }
 
 // mux is started in it's own goroutine after initial connection establishment.
@@ -463,7 +463,7 @@ func (c *Conn) mux() {
 					break
 				}
 
-				session.remoteChannel = fr.Channel
+				session.SetRemoteChannel(fr.Channel)
 				sessionsByRemoteChannel[fr.Channel] = session
 
 			case *frames.PerformEnd:
@@ -490,7 +490,7 @@ func (c *Conn) mux() {
 			}
 
 			select {
-			case session.rx <- fr:
+			case session.RX() <- fr:
 			case <-c.closeMux:
 				return
 			}

@@ -30,6 +30,7 @@ const (
 )
 
 type Conn interface {
+	DeleteSession(*Session)
 	SendFrame(fr frames.Frame) error
 
 	Done() <-chan struct{}
@@ -122,6 +123,72 @@ func New(c Conn, channel uint16, opts *SessionOptions) *Session {
 	return s
 }
 
+func (s *Session) Begin(ctx context.Context) error {
+	// send Begin to server
+	begin := &frames.PerformBegin{
+		NextOutgoingID: 0,
+		IncomingWindow: s.incomingWindow,
+		OutgoingWindow: s.outgoingWindow,
+		HandleMax:      s.handleMax,
+	}
+	debug.Log(1, "TX (NewSession): %s", begin)
+
+	// we use send to have positive confirmation on transmission
+	send := make(chan encoding.DeliveryState)
+	_ = s.TXFrame(begin, send)
+
+	// wait for response
+	var fr frames.Frame
+	select {
+	case <-ctx.Done():
+		select {
+		case <-send:
+			// begin was written to the network.  assume it was
+			// received and that the ctx was too short to wait for
+			// the ack. in this case we must send an end before we
+			// can delete the session
+			go func() {
+				_ = s.TXFrame(&frames.PerformEnd{}, nil)
+				select {
+				case <-s.conn.Done():
+					// conn has terminated, no need to delete the session
+				case <-time.After(5 * time.Second):
+					debug.Log(3, "NewSession clean-up timed out waiting for PerformEnd ack")
+				case <-s.rx:
+					// received ack that session was closed, safe to delete session
+					s.conn.DeleteSession(s)
+				}
+			}()
+		default:
+			// begin wasn't written to the network, so delete session
+			s.conn.DeleteSession(s)
+		}
+		return ctx.Err()
+	case <-s.conn.Done():
+		return s.conn.Err()
+	case fr = <-s.rx:
+		// received ack that session was created
+	}
+	debug.Log(1, "RX (NewSession): %s", fr.Body)
+
+	begin, ok := fr.Body.(*frames.PerformBegin)
+	if !ok {
+		// this codepath is hard to hit (impossible?).  if the response isn't a PerformBegin and we've not
+		// yet seen the remote channel number, the default clause in conn.mux will protect us from that.
+		// if we have seen the remote channel number then it's likely the session.mux for that channel will
+		// either swallow the frame or blow up in some other way, both causing this call to hang.
+		// deallocate session on error.  we can't call
+		// s.Close() as the session mux hasn't started yet.
+		s.conn.DeleteSession(s)
+		return fmt.Errorf("unexpected begin response: %+v", fr.Body)
+	}
+
+	// start Session multiplexor
+	go s.mux(begin)
+
+	return nil
+}
+
 // Close gracefully closes the session.
 //
 // If ctx expires while waiting for servers response, ctx.Err() will be returned.
@@ -137,6 +204,14 @@ func (s *Session) Close(ctx context.Context) error {
 		return nil
 	}
 	return s.err
+}
+
+func (s *Session) Channel() uint16 {
+	return s.channel
+}
+
+func (s *Session) SetRemoteChannel(rc uint16) {
+	s.remoteChannel = rc
 }
 
 func (s *Session) Done() <-chan struct{} {
@@ -157,6 +232,10 @@ func (s *Session) TX() chan<- frames.FrameBody {
 
 func (s *Session) TXTransfer() chan<- *frames.PerformTransfer {
 	return s.txTransfer
+}
+
+func (s *Session) RX() chan<- frames.Frame {
+	return s.rx
 }
 
 // txFrame sends a frame to the connWriter.

@@ -2,10 +2,72 @@ package amqp
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
+	"time"
 
 	"github.com/Azure/go-amqp/internal/conn"
+	"github.com/Azure/go-amqp/internal/session"
 )
+
+// ConnOptions contains the optional settings for configuring an AMQP connection.
+type ConnOptions struct {
+	// ContainerID sets the container-id to use when opening the connection.
+	//
+	// A container ID will be randomly generated if this option is not used.
+	ContainerID string
+
+	// HostName sets the hostname sent in the AMQP
+	// Open frame and TLS ServerName (if not otherwise set).
+	HostName string
+
+	// IdleTimeout specifies the maximum period in milliseconds between
+	// receiving frames from the peer.
+	//
+	// Specify a value less than zero to disable idle timeout.
+	//
+	// Default: 1 minute.
+	IdleTimeout time.Duration
+
+	// MaxFrameSize sets the maximum frame size that
+	// the connection will accept.
+	//
+	// Must be 512 or greater.
+	//
+	// Default: 512.
+	MaxFrameSize uint32
+
+	// MaxSessions sets the maximum number of channels.
+	// The value must be greater than zero.
+	//
+	// Default: 65535.
+	MaxSessions uint16
+
+	// Properties sets an entry in the connection properties map sent to the server.
+	Properties map[string]interface{}
+
+	// SASLType contains the specified SASL authentication mechanism.
+	SASLType SASLType
+
+	// Timeout configures how long to wait for the
+	// server during connection establishment.
+	//
+	// Once the connection has been established, IdleTimeout
+	// applies. If duration is zero, no timeout will be applied.
+	//
+	// Default: 0.
+	Timeout time.Duration
+
+	// TLSConfig sets the tls.Config to be used during
+	// TLS negotiation.
+	//
+	// This option is for advanced usage, in most scenarios
+	// providing a URL scheme of "amqps://" is sufficient.
+	TLSConfig *tls.Config
+
+	// test hook
+	dialer dialer
+}
 
 // Client is an AMQP client connection.
 type Client struct {
@@ -56,15 +118,15 @@ func (c *Client) Close() error {
 // Returns ErrConnClosed if the underlying connection has been closed.
 // opts: pass nil to accept the default values.
 func (c *Client) NewSession(ctx context.Context, opts *SessionOptions) (*Session, error) {
-	s, err := c.conn.NewSession(opts)
+	s, err := c.conn.NewSession((*session.SessionOptions)(opts))
 	if err != nil {
 		return nil, err
 	}
 
-	if err = s.begin(ctx); err != nil {
+	if err = s.Begin(ctx); err != nil {
 		return nil, err
 	}
-	return s, nil
+	return &Session{impl: s}, nil
 }
 
 // SessionOption contains the optional settings for configuring an AMQP session.
