@@ -17,13 +17,6 @@ const (
 // SenderSettleMode specifies how the sender will settle messages.
 type SenderSettleMode = encoding.SenderSettleMode
 
-func senderSettleModeValue(m *SenderSettleMode) SenderSettleMode {
-	if m == nil {
-		return ModeMixed
-	}
-	return *m
-}
-
 // Receiver Settlement Modes
 const (
 	// Receiver will spontaneously settle all incoming transfers.
@@ -37,13 +30,6 @@ const (
 
 // ReceiverSettleMode specifies how the receiver will settle messages.
 type ReceiverSettleMode = encoding.ReceiverSettleMode
-
-func receiverSettleModeValue(m *ReceiverSettleMode) ReceiverSettleMode {
-	if m == nil {
-		return ModeFirst
-	}
-	return *m
-}
 
 // Durability Policies
 const (

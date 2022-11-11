@@ -1,4 +1,4 @@
-package amqp
+package link
 
 import (
 	"context"
@@ -8,12 +8,40 @@ import (
 
 	"github.com/Azure/go-amqp/internal/debug"
 	"github.com/Azure/go-amqp/internal/encoding"
+	"github.com/Azure/go-amqp/internal/exported"
 	"github.com/Azure/go-amqp/internal/frames"
 )
 
+type Session interface {
+	AllocateHandle(*Link) error
+	DeallocateHandle(*Link)
+
+	Done() <-chan struct{}
+	Err() error
+
+	TX() chan<- frames.FrameBody
+	TXTransfer() chan<- *frames.PerformTransfer
+	TXFrame(frames.FrameBody, chan encoding.DeliveryState) error
+
+	NextDeliveryID() uint32
+}
+
+// Key uniquely identifies a link on a connection by name and direction.
+//
+// A link can be identified uniquely by the ordered tuple
+//
+//	(source-container-id, target-container-id, name)
+//
+// On a single connection the container ID pairs can be abbreviated
+// to a boolean flag indicating the direction of the link.
+type Key struct {
+	Name string
+	Role encoding.Role // Local role: sender/receiver
+}
+
 // link contains the common state and methods for sending and receiving links
-type link struct {
-	key          linkKey               // Name and direction
+type Link struct {
+	key          Key                   // Name and direction
 	handle       uint32                // our handle
 	remoteHandle uint32                // remote's handle
 	dynamicAddr  bool                  // request a dynamic link address from the server
@@ -31,8 +59,8 @@ type link struct {
 	detached chan struct{}
 
 	detachErrorMu sync.Mutex                      // protects detachError
-	detachError   *Error                          // error to send to remote on detach, set by closeWithError
-	session       *Session                        // parent session
+	detachError   *encoding.Error                 // error to send to remote on detach, set by closeWithError
+	session       Session                         // parent session
 	source        *frames.Source                  // used for Receiver links
 	target        *frames.Target                  // used for Sender links
 	properties    map[encoding.Symbol]interface{} // additional properties sent upon link attach
@@ -45,22 +73,54 @@ type link struct {
 	// initialized at an arbitrary point by the sender."
 	deliveryCount      uint32
 	linkCredit         uint32 // maximum number of messages allowed between flow updates
-	senderSettleMode   *SenderSettleMode
-	receiverSettleMode *ReceiverSettleMode
+	senderSettleMode   *encoding.SenderSettleMode
+	receiverSettleMode *encoding.ReceiverSettleMode
 	maxMessageSize     uint64
 	detachReceived     bool
 	err                error // err returned on Close()
 }
 
+func (l *Link) Key() Key {
+	return l.key
+}
+
+func (l *Link) GetHandle() uint32 {
+	return l.handle
+}
+
+func (l *Link) SetHandle(h uint32) {
+	l.handle = h
+}
+
+func (l *Link) GetRemoteHandle() uint32 {
+	return l.remoteHandle
+}
+
+func (l *Link) SetRemoteHandle(rh uint32) {
+	l.remoteHandle = rh
+}
+
+func (l *Link) RSM() *encoding.ReceiverSettleMode {
+	return l.receiverSettleMode
+}
+
+func (l *Link) RX() chan<- frames.FrameBody {
+	return l.rx
+}
+
+func (l *Link) Detached() <-chan struct{} {
+	return l.detached
+}
+
 // attach sends the Attach performative to establish the link with its parent session.
 // this is automatically called by the new*Link constructors.
-func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAttach), afterAttach func(*frames.PerformAttach)) error {
+func (l *Link) attach(ctx context.Context, beforeAttach func(*frames.PerformAttach), afterAttach func(*frames.PerformAttach)) error {
 	if err := l.session.allocateHandle(l); err != nil {
 		return err
 	}
 
 	attach := &frames.PerformAttach{
-		Name:               l.key.name,
+		Name:               l.key.Name,
 		Handle:             l.handle,
 		ReceiverSettleMode: l.receiverSettleMode,
 		SenderSettleMode:   l.senderSettleMode,
@@ -78,7 +138,7 @@ func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAtta
 
 	// we use send to have positive confirmation on transmission
 	send := make(chan encoding.DeliveryState)
-	_ = l.session.txFrame(attach, send)
+	_ = l.session.TXFrame(attach, send)
 
 	// wait for response
 	var fr frames.FrameBody
@@ -90,28 +150,28 @@ func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAtta
 			// and that the ctx was too short to wait for the ack. in this
 			// case we must send a detach before deallocation
 			go func() {
-				_ = l.session.txFrame(&frames.PerformDetach{
+				_ = l.session.TXFrame(&frames.PerformDetach{
 					Handle: l.handle,
 					Closed: true,
 				}, nil)
 				select {
-				case <-l.session.done:
+				case <-l.session.Done():
 					// session has terminated, no need to deallocate in this case
 				case <-time.After(5 * time.Second):
 					debug.Log(3, "link.attach() clean-up timed out waiting for ack")
 				case <-l.rx:
 					// received ack, safe to delete handle
-					l.session.deallocateHandle(l)
+					l.session.DeallocateHandle(l)
 				}
 			}()
 		default:
 			// attach wasn't written to the network, so delete the handle
-			l.session.deallocateHandle(l)
+			l.session.DeallocateHandle(l)
 		}
 		return ctx.Err()
-	case <-l.session.done:
+	case <-l.session.Done():
 		// session has terminated, no need to deallocate in this case
-		return l.session.err
+		return l.session.Err()
 	case fr = <-l.rx:
 	}
 	debug.Log(3, "RX (attachLink): %s", fr)
@@ -135,17 +195,17 @@ func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAtta
 		case <-ctx.Done():
 			// if we don't send an ack then we're in violation of the protocol
 			go func() {
-				_ = l.session.txFrame(&frames.PerformDetach{
+				_ = l.session.TXFrame(&frames.PerformDetach{
 					Handle: l.handle,
 					Closed: true,
 				}, nil)
-				l.session.deallocateHandle(l)
+				l.session.DeallocateHandle(l)
 			}()
 			return ctx.Err()
-		case <-l.session.done:
-			return l.session.err
+		case <-l.session.Done():
+			return l.session.Err()
 		case fr = <-l.rx:
-			l.session.deallocateHandle(l)
+			l.session.DeallocateHandle(l)
 		}
 
 		detach, ok := fr.(*frames.PerformDetach)
@@ -159,7 +219,7 @@ func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAtta
 			Closed: true,
 		}
 		debug.Log(1, "TX (attachLink): %s", fr)
-		_ = l.session.txFrame(fr, nil)
+		_ = l.session.TXFrame(fr, nil)
 
 		if detach.Error == nil {
 			return fmt.Errorf("received detach with no error specified")
@@ -186,7 +246,7 @@ func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAtta
 //
 // If a settlement mode has been explicitly set locally and it was not honored by the
 // server an error is returned.
-func (l *link) setSettleModes(resp *frames.PerformAttach) error {
+func (l *Link) setSettleModes(resp *frames.PerformAttach) error {
 	var (
 		localRecvSettle = receiverSettleModeValue(l.receiverSettleMode)
 		respRecvSettle  = receiverSettleModeValue(resp.ReceiverSettleMode)
@@ -209,7 +269,7 @@ func (l *link) setSettleModes(resp *frames.PerformAttach) error {
 }
 
 // muxHandleFrame processes fr based on type.
-func (l *link) muxHandleFrame(fr frames.FrameBody) error {
+func (l *Link) muxHandleFrame(fr frames.FrameBody) error {
 	switch fr := fr.(type) {
 	// remote side is closing links
 	case *frames.PerformDetach:
@@ -222,7 +282,7 @@ func (l *link) muxHandleFrame(fr frames.FrameBody) error {
 		// set detach received and close link
 		l.detachReceived = true
 
-		return &DetachError{fr.Error}
+		return &exported.DetachError{fr.Error}
 
 	default:
 		// TODO: evaluate
@@ -233,7 +293,7 @@ func (l *link) muxHandleFrame(fr frames.FrameBody) error {
 }
 
 // Close closes the Sender and AMQP link.
-func (l *link) closeLink(ctx context.Context) error {
+func (l *Link) closeLink(ctx context.Context) error {
 	l.closeOnce.Do(func() { close(l.close) })
 	select {
 	case <-l.detached:
@@ -241,18 +301,18 @@ func (l *link) closeLink(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if l.err == ErrLinkClosed {
+	if l.err == exported.ErrLinkClosed {
 		return nil
 	}
 	return l.err
 }
 
-func (l *link) muxDetach(deferred func(), onRXTransfer func(frames.PerformTransfer)) {
+func (l *Link) muxDetach(deferred func(), onRXTransfer func(frames.PerformTransfer)) {
 	defer func() {
 		// final cleanup and signaling
 
 		// deallocate handle
-		l.session.deallocateHandle(l)
+		l.session.DeallocateHandle(l)
 
 		if deferred != nil {
 			deferred()
@@ -286,7 +346,7 @@ func (l *link) muxDetach(deferred func(), onRXTransfer func(frames.PerformTransf
 Loop:
 	for {
 		select {
-		case l.session.tx <- fr:
+		case l.session.TX() <- fr:
 			// after sending the detach frame, break the read loop
 			break Loop
 		case fr := <-l.rx:
@@ -301,9 +361,9 @@ Loop:
 					onRXTransfer(*fr)
 				}
 			}
-		case <-l.session.done:
+		case <-l.session.Done():
 			if l.err == nil {
-				l.err = l.session.err
+				l.err = l.session.Err()
 			}
 			return
 		}
@@ -330,11 +390,25 @@ Loop:
 			}
 
 		// connection has ended
-		case <-l.session.done:
+		case <-l.session.Done():
 			if l.err == nil {
-				l.err = l.session.err
+				l.err = l.session.Err()
 			}
 			return
 		}
 	}
+}
+
+func receiverSettleModeValue(m *encoding.ReceiverSettleMode) encoding.ReceiverSettleMode {
+	if m == nil {
+		return encoding.ModeFirst
+	}
+	return *m
+}
+
+func senderSettleModeValue(m *encoding.SenderSettleMode) encoding.SenderSettleMode {
+	if m == nil {
+		return encoding.ModeMixed
+	}
+	return *m
 }

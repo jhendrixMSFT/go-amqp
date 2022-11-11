@@ -4,12 +4,12 @@ import (
 	"context"
 	"net"
 
-	"github.com/Azure/go-amqp/internal/encoding"
+	"github.com/Azure/go-amqp/internal/conn"
 )
 
 // Client is an AMQP client connection.
 type Client struct {
-	conn *conn
+	conn *conn.Conn
 }
 
 // Dial connects to an AMQP server.
@@ -22,7 +22,7 @@ type Client struct {
 //
 // opts: pass nil to accept the default values.
 func Dial(addr string, opts *ConnOptions) (*Client, error) {
-	c, err := dialConn(addr, opts)
+	c, err := conn.Dial(addr, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -35,8 +35,8 @@ func Dial(addr string, opts *ConnOptions) (*Client, error) {
 
 // New establishes an AMQP client connection over conn.
 // opts: pass nil to accept the default values.
-func New(conn net.Conn, opts *ConnOptions) (*Client, error) {
-	c, err := newConn(conn, opts)
+func New(netConn net.Conn, opts *ConnOptions) (*Client, error) {
+	c, err := conn.New(netConn, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -84,18 +84,3 @@ type SessionOptions struct {
 	// Default: 4294967295.
 	MaxLinks uint32
 }
-
-// linkKey uniquely identifies a link on a connection by name and direction.
-//
-// A link can be identified uniquely by the ordered tuple
-//
-//	(source-container-id, target-container-id, name)
-//
-// On a single connection the container ID pairs can be abbreviated
-// to a boolean flag indicating the direction of the link.
-type linkKey struct {
-	name string
-	role encoding.Role // Local role: sender/receiver
-}
-
-const maxTransferFrameHeader = 66 // determined by calcMaxTransferFrameHeader
