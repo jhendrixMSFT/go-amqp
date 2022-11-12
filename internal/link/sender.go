@@ -43,6 +43,13 @@ func (s *Sender) MaxMessageSize() uint64 {
 	return s.l.maxMessageSize
 }
 
+type SenderMsg struct {
+	DeliveryTag []byte
+	Format      uint32
+	Marshal     func(*buffer.Buffer) error
+	SendSettled bool
+}
+
 // Send sends a Message.
 //
 // Blocks until the message is sent, ctx completes, or an error occurs.
@@ -52,7 +59,7 @@ func (s *Sender) MaxMessageSize() uint64 {
 // has been requested (receiver settle mode is "Second"). In this case,
 // additional messages can be sent while the current goroutine is waiting
 // for the confirmation.
-func (s *Sender) Send(ctx context.Context, msg *Message) error {
+func (s *Sender) Send(ctx context.Context, msg *SenderMsg) error {
 	// check if the link is dead.  while it's safe to call s.send
 	// in this case, this will avoid some allocations etc.
 	select {
@@ -85,7 +92,7 @@ func (s *Sender) Send(ctx context.Context, msg *Message) error {
 
 // send is separated from Send so that the mutex unlock can be deferred without
 // locking the transfer confirmation that happens in Send.
-func (s *Sender) send(ctx context.Context, msg *Message) (chan encoding.DeliveryState, error) {
+func (s *Sender) send(ctx context.Context, msg *SenderMsg) (chan encoding.DeliveryState, error) {
 	const maxDeliveryTagLength = 32
 	if len(msg.DeliveryTag) > maxDeliveryTagLength {
 		return nil, fmt.Errorf("delivery tag is over the allowed %v bytes, len: %v", maxDeliveryTagLength, len(msg.DeliveryTag))
@@ -248,7 +255,7 @@ func (s *Sender) Attach(ctx context.Context, session Session) error {
 
 	s.l.rx = make(chan frames.FrameBody, 1)
 
-	if err := s.l.attach(ctx, session, func(pa *frames.PerformAttach) {
+	if err := s.l.attach(ctx, func(pa *frames.PerformAttach) {
 		pa.Role = encoding.RoleSender
 		if pa.Target == nil {
 			pa.Target = new(frames.Target)

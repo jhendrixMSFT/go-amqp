@@ -37,11 +37,19 @@ func (s *Session) Close(ctx context.Context) error {
 // NewReceiver opens a new receiver link on the session.
 // opts: pass nil to accept the default values.
 func (s *Session) NewReceiver(ctx context.Context, source string, opts *ReceiverOptions) (*Receiver, error) {
-	return s.impl.NewReceiver(ctx, source, opts)
+	rcv, err := s.impl.NewReceiver(ctx, source, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Receiver{impl: rcv}, nil
 }
 
 // NewSender opens a new sender link on the session.
 // opts: pass nil to accept the default values.
 func (s *Session) NewSender(ctx context.Context, target string, opts *SenderOptions) (*Sender, error) {
-	return s.impl.NewSender(ctx, target, opts)
+	snd, err := s.impl.NewSender(ctx, target, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Sender{impl: snd}, nil
 }

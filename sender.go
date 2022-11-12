@@ -31,7 +31,12 @@ func (s *Sender) MaxMessageSize() uint64 {
 // additional messages can be sent while the current goroutine is waiting
 // for the confirmation.
 func (s *Sender) Send(ctx context.Context, msg *Message) error {
-	return s.impl.Send(ctx, msg)
+	return s.impl.Send(ctx, &link.SenderMsg{
+		DeliveryTag: msg.DeliveryTag,
+		Format:      msg.Format,
+		Marshal:     msg.Marshal,
+		SendSettled: msg.SendSettled,
+	})
 }
 
 // Address returns the link's address.

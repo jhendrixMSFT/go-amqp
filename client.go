@@ -84,7 +84,7 @@ type Client struct {
 //
 // opts: pass nil to accept the default values.
 func Dial(addr string, opts *ConnOptions) (*Client, error) {
-	c, err := conn.Dial(addr, opts)
+	c, err := conn.Dial(addr, (*conn.ConnOptions)(opts))
 	if err != nil {
 		return nil, err
 	}

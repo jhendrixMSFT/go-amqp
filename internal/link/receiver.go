@@ -486,7 +486,7 @@ func (r *Receiver) Attach(ctx context.Context, s Session) error {
 		r.l.rx = make(chan frames.FrameBody, r.l.linkCredit)
 	}
 
-	if err := r.l.attach(ctx, s, func(pa *frames.PerformAttach) {
+	if err := r.l.attach(ctx, func(pa *frames.PerformAttach) {
 		pa.Role = encoding.RoleReceiver
 		if pa.Source == nil {
 			pa.Source = new(frames.Source)
