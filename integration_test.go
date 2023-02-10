@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -24,7 +23,7 @@ var rng *rand.Rand
 func init() {
 	// rand used to generate queue names, non-determinism is fine for this use
 	rng = rand.New(rand.NewSource(time.Now().UnixNano()))
-	localBrokerAddr = os.Getenv("AMQP_BROKER_ADDR")
+	localBrokerAddr = "amqp://localhost:25672" //os.Getenv("AMQP_BROKER_ADDR")
 }
 
 type lockedError struct {
@@ -984,6 +983,160 @@ func TestSenderExactlyOnce(t *testing.T) {
 	require.Equal(t, "hello!", string(msg.GetData()))
 	client.Close()
 	checkLeaks()
+}
+
+func TestIncomingWindowViolation(t *testing.T) {
+	if localBrokerAddr == "" {
+		t.Skip()
+	}
+
+	checkLeaks := leaktest.CheckTimeout(t, 60*time.Second)
+
+	// Create client
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	client, err := amqp.Dial(ctx, localBrokerAddr, nil)
+	cancel()
+	require.NoError(t, err)
+	defer client.Close()
+
+	const incomingWindow = 10
+
+	// Open a session
+	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+	session, err := client.NewSession(ctx, &amqp.SessionOptions{
+		IncomingWindow: incomingWindow,
+	})
+	cancel()
+	require.NoError(t, err)
+
+	// Create a sender
+	// add a random suffix to the link name so the test broker always creates a new node
+	targetName := fmt.Sprintf("TestIncomingWindowViolation-%d", rng.Uint64())
+	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+	sender, err := session.NewSender(ctx, targetName, nil)
+	cancel()
+	require.NoError(t, err)
+
+	// send twice the size of the incoming window
+	for i := 0; i < 2*incomingWindow; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		err = sender.Send(ctx, amqp.NewMessage([]byte("something")), nil)
+		cancel()
+		if err != nil {
+			t.Fatalf("Error after %d sends: %+v", i, err)
+		}
+	}
+	testClose(t, sender.Close)
+
+	// Create a receiver with max credit greater than the incoming window
+	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+	receiver, err := session.NewReceiver(ctx, targetName, &amqp.ReceiverOptions{
+		MaxCredit:                 2 * incomingWindow,
+		SettlementMode:            amqp.ReceiverSettleModeSecond.Ptr(),
+		RequestedSenderSettleMode: amqp.SenderSettleModeUnsettled.Ptr(),
+	})
+	cancel()
+	require.NoError(t, err)
+
+	// read messages
+	for i := 0; i < 2*incomingWindow; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		msg, err := receiver.Receive(ctx, nil)
+		cancel()
+		if err != nil {
+			t.Fatalf("Error after %d receives: %+v", i, err)
+		}
+		fmt.Printf("received %d\n", i)
+		ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+		err = receiver.AcceptMessage(ctx, msg)
+		cancel()
+		require.NoError(t, err)
+	}
+
+	// close link
+	testClose(t, receiver.Close)
+	client.Close() // close before leak check
+	checkLeaks()   // this is done here because queuesClient starts additional goroutines
+}
+
+func TestOutgoingWindowViolation(t *testing.T) {
+	if localBrokerAddr == "" {
+		t.Skip()
+	}
+
+	checkLeaks := leaktest.CheckTimeout(t, 60*time.Second)
+
+	// Create client
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	client, err := amqp.Dial(ctx, localBrokerAddr, nil)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// Open a session
+	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+	session, err := client.NewSession(ctx, nil)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a sender
+	// add a random suffix to the link name so the test broker always creates a new node
+	targetName := fmt.Sprintf("TestOutgoingWindowViolation-%d", rng.Uint64())
+	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+	sender, err := session.NewSender(ctx, targetName, nil)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		err = sender.Send(ctx, amqp.NewMessage([]byte("test")), nil)
+		cancel()
+		if err != nil {
+			t.Fatalf("Error after %d sends: %+v", i, err)
+		}
+	}
+	testClose(t, sender.Close)
+
+	// Create a receiver
+	ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+	receiver, err := session.NewReceiver(ctx, targetName, &amqp.ReceiverOptions{
+		MaxCredit:                 100,
+		RequestedSenderSettleMode: amqp.SenderSettleModeSettled.Ptr(),
+	})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// read buffered messages
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		msg, err := receiver.Receive(ctx, nil)
+		cancel()
+		if err != nil {
+			t.Fatalf("Error after %d receives: %+v", i, err)
+		}
+		/*if !bytes.Equal([]byte(data), msg.GetData()) {
+			t.Fatalf("Expected received message %d to be %v, but it was %v", i+1, string(data), string(msg.GetData()))
+		}*/
+		ctx, cancel = context.WithTimeout(context.Background(), 1*time.Second)
+		err = receiver.AcceptMessage(ctx, msg)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// close link
+	testClose(t, receiver.Close)
+	client.Close() // close before leak check
+	checkLeaks()   // this is done here because queuesClient starts additional goroutines
 }
 
 func repeatStrings(count int, strs ...string) []string {

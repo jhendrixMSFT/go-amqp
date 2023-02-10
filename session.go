@@ -45,12 +45,14 @@ type SessionOptions struct {
 //
 // A session multiplexes Receivers.
 type Session struct {
-	channel       uint16                       // session's local channel
-	remoteChannel uint16                       // session's remote channel, owned by conn.connReader
-	conn          *Conn                        // underlying conn
-	rx            chan frames.FrameBody        // frames destined for this session are sent on this chan by conn.connReader
-	tx            chan frames.FrameBody        // non-transfer frames to be sent; session must track disposition
-	txTransfer    chan *frames.PerformTransfer // transfer frames to be sent; session must track disposition
+	channel       uint16                // session's local channel
+	remoteChannel uint16                // session's remote channel, owned by conn.connReader
+	conn          *Conn                 // underlying conn
+	rx            chan frames.FrameBody // frames destined for this session are sent on this chan by conn.connReader
+	tx            chan frames.FrameBody // non-transfer frames to be sent; session must track disposition
+
+	txTransfer chan *frames.PerformTransfer // transfer frames to be sent; session must track disposition
+	rxTransfer chan *frames.PerformTransfer // incoming transfer frames
 
 	// flow control
 	incomingWindow uint32
@@ -79,7 +81,6 @@ func newSession(c *Conn, channel uint16, opts *SessionOptions) *Session {
 		channel:        channel,
 		rx:             make(chan frames.FrameBody),
 		tx:             make(chan frames.FrameBody),
-		txTransfer:     make(chan *frames.PerformTransfer),
 		incomingWindow: defaultWindow,
 		outgoingWindow: defaultWindow,
 		handleMax:      math.MaxUint32,
@@ -103,8 +104,10 @@ func newSession(c *Conn, channel uint16, opts *SessionOptions) *Session {
 			s.outgoingWindow = opts.OutgoingWindow
 		}
 	}
-	// create handle map after options have been applied
+	// create handle map and incoming/outgoing transfer channels after options have been applied
 	s.handles = bitmap.New(s.handleMax)
+	s.txTransfer = make(chan *frames.PerformTransfer, s.outgoingWindow)
+	s.rxTransfer = make(chan *frames.PerformTransfer, s.incomingWindow)
 	return s
 }
 
@@ -325,11 +328,16 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 					handle, ok := handles[deliveryID]
 					if !ok {
 						debug.Log(2, "RX (Session): role %s: didn't find deliveryID %d in handles map", body.Role, deliveryID)
+						err := &Error{Condition: ErrCondUnattachedHandle, Description: fmt.Sprintf("Session %d missing delivery ID %d", s.channel, deliveryID)}
+						s.doneErr = err
+						closed <- err
 						continue
 					}
 					delete(handles, deliveryID)
 
 					if body.Settled && body.Role == encoding.RoleReceiver {
+						s.outgoingWindow++
+
 						// check if settlement confirmation was requested, if so
 						// confirm by closing channel
 						if done, ok := settlementByDeliveryID[deliveryID]; ok {
@@ -340,6 +348,8 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 							}
 							close(done)
 						}
+					} else if body.Settled && body.Role == encoding.RoleSender {
+						s.incomingWindow++
 					}
 
 					link, ok := links[handle]
@@ -428,6 +438,14 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 				s.muxFrameToLink(link, fr)
 
 			case *frames.PerformTransfer:
+				// TODO: don't reject Nth transfer frames in a multi-frame message
+				if s.incomingWindow == 0 {
+					err := &Error{Condition: ErrCondWindowViolation, Description: fmt.Sprintf("Session %d", s.channel)}
+					s.doneErr = err
+					closed <- err
+					continue
+				}
+
 				s.needFlowCount++
 				// "Upon receiving a transfer, the receiving endpoint will
 				// increment the next-incoming-id to match the implicit
@@ -435,13 +453,23 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 				// as decrementing the remote-outgoing-window, and MAY
 				// (depending on policy) decrement its incoming-window."
 				nextIncomingID++
-				// don't loop to intmax
+
 				if remoteOutgoingWindow > 0 {
 					remoteOutgoingWindow--
 				}
+
+				// TODO: don't shrink window for Nth transfer frames in a multi-frame message
+				// TODO: if the message is sender-settled, does the window still shrink?
+				if s.incomingWindow > 0 {
+					s.incomingWindow--
+				}
+
 				link, ok := links[body.Handle]
 				if !ok {
-					// TODO: per section 2.8.17 I think this should return an error
+					// per section 2.8.17 this will terminate the session
+					err := &Error{Condition: ErrCondErrantLink, Description: fmt.Sprintf("Session %d has no link handle %d", s.channel, body.Handle)}
+					s.doneErr = err
+					closed <- err
 					continue
 				}
 
@@ -551,9 +579,14 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 			// its next-outgoing-id, decrement its remote-incoming-window,
 			// and MAY (depending on policy) decrement its outgoing-window."
 			nextOutgoingID++
-			// don't decrement if we're at 0 or we could loop to int max
-			if remoteIncomingWindow != 0 {
+
+			if remoteIncomingWindow > 0 {
 				remoteIncomingWindow--
+			}
+
+			// TODO: if the message is pre-settled, does the outgoing window shrink?
+			if s.outgoingWindow > 0 {
+				s.outgoingWindow--
 			}
 
 		case fr := <-s.tx:
