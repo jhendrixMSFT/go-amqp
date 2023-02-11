@@ -296,11 +296,11 @@ func (s *Sender) mux() {
 Loop:
 	for {
 		var outgoingTransfers chan frames.PerformTransfer
-		if s.l.availableCredit > 0 {
-			debug.Log(1, "TX (Sender) (enable): target: %q, available credit: %d, deliveryCount: %d", s.l.target.Address, s.l.availableCredit, s.l.deliveryCount)
+		if s.l.linkCredit > 0 {
+			debug.Log(1, "TX (Sender) (enable): target: %q, link credit: %d, deliveryCount: %d", s.l.target.Address, s.l.linkCredit, s.l.deliveryCount)
 			outgoingTransfers = s.transfers
 		} else {
-			debug.Log(1, "TX (Sender) (pause): target: %q, available credit: %d, deliveryCount: %d", s.l.target.Address, s.l.availableCredit, s.l.deliveryCount)
+			debug.Log(1, "TX (Sender) (pause): target: %q, link credit: %d, deliveryCount: %d", s.l.target.Address, s.l.linkCredit, s.l.deliveryCount)
 		}
 
 		if len(outgoingDisps) > 0 && len(outgoingDisp) == 0 {
@@ -355,9 +355,11 @@ Loop:
 					// decrement link-credit after entire message transferred
 					if !tr.More {
 						s.l.deliveryCount++
-						s.l.availableCredit--
+						// Additionally, whenever the sender increases delivery-count, it MUST decrease link-credit
+						// by the same amount in order to maintain the delivery-limit identified by the receiver.
+						s.l.linkCredit--
 						// we are the sender and we keep track of the peer's link credit
-						debug.Log(3, "TX (Sender): link: %s, available credit: %d", s.l.key.name, s.l.availableCredit)
+						debug.Log(3, "TX (Sender): link: %s, available credit: %d", s.l.key.name, s.l.linkCredit)
 					}
 					continue Loop
 				case fr := <-s.l.rx:
@@ -389,6 +391,14 @@ func (s *Sender) muxHandleFrame(fr frames.FrameBody) (*frames.PerformDisposition
 	switch fr := fr.(type) {
 	// flow control frame
 	case *frames.PerformFlow:
+		// The sender's link-credit variable MUST be set according to this formula when flow information is given by the receiver:
+		//
+		//   link-credit(snd) := delivery-count(rcv) + link-credit(rcv) - delivery-count(snd)
+		//
+		// In the event that the receiver does not yet know the delivery-count, i.e., delivery-count(rcv) is unspecified, the sender
+		// MUST assume that the delivery-count(rcv) is the first delivery-count(snd) sent from sender to receiver, i.e., the
+		// delivery-count(snd) specified in the flow state carried by the initial attach frame from the sender to the receiver.
+		// NOTE: we always attach the sender with a delivery-count of zero
 		linkCredit := *fr.LinkCredit - s.l.deliveryCount
 		if fr.DeliveryCount != nil {
 			// DeliveryCount can be nil if the receiver hasn't processed
@@ -396,8 +406,7 @@ func (s *Sender) muxHandleFrame(fr frames.FrameBody) (*frames.PerformDisposition
 			// what ActiveMQ does.
 			linkCredit += *fr.DeliveryCount
 		}
-		// TODO: clean up as part of flow control fixes
-		s.l.availableCredit = linkCredit
+		s.l.linkCredit = linkCredit
 
 		if !fr.Echo {
 			return nil, nil
