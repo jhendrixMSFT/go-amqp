@@ -131,7 +131,9 @@ func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAtta
 	// link-specific configuration of the attach frame
 	beforeAttach(attach)
 
-	_ = l.session.txFrame(attach, nil)
+	if err := l.session.txFrameAndWait(ctx, attach); err != nil {
+		return err
+	}
 
 	// wait for response
 	fr, err := l.waitForFrame(ctx)
@@ -179,7 +181,9 @@ func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAtta
 			Handle: l.handle,
 			Closed: true,
 		}
-		_ = l.session.txFrame(fr, nil)
+		if err = l.session.txFrameAndWait(ctx, fr); err != nil {
+			return err
+		}
 
 		if detach.Error == nil {
 			return fmt.Errorf("received detach with no error specified")
@@ -200,7 +204,9 @@ func (l *link) attach(ctx context.Context, beforeAttach func(*frames.PerformAtta
 			Handle: l.handle,
 			Closed: true,
 		}
-		_ = l.session.txFrame(dr, nil)
+		if err := l.session.txFrameAndWait(ctx, dr); err != nil {
+			return err
+		}
 		return err
 	}
 
@@ -260,7 +266,7 @@ func (l *link) muxHandleFrame(fr frames.FrameBody) error {
 			Handle: l.handle,
 			Closed: true,
 		}
-		_ = l.session.txFrame(dr, nil)
+		l.session.txFrame(context.Background(), dr, nil)
 		return &LinkError{RemoteErr: fr.Error}
 
 	default:
@@ -322,7 +328,7 @@ func (l *link) closeWithError(cnd ErrCond, desc string) {
 	}
 	l.closeInProgress = true
 	l.doneErr = &LinkError{inner: fmt.Errorf("%s: %s", cnd, desc)}
-	_ = l.session.txFrame(dr, nil)
+	l.session.txFrame(context.Background(), dr, nil)
 }
 
 const strLinkForciblyClosed = "link %s was forcibly closed"

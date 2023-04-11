@@ -238,7 +238,7 @@ func (r *Receiver) Close(ctx context.Context) error {
 }
 
 // sendDisposition sends a disposition frame to the peer
-func (r *Receiver) sendDisposition(first uint32, last *uint32, state encoding.DeliveryState) error {
+func (r *Receiver) sendDisposition(ctx context.Context, first uint32, last *uint32, state encoding.DeliveryState) error {
 	fr := &frames.PerformDisposition{
 		Role:    encoding.RoleReceiver,
 		First:   first,
@@ -252,7 +252,7 @@ func (r *Receiver) sendDisposition(first uint32, last *uint32, state encoding.De
 		return r.l.doneErr
 	default:
 		// TODO: this is racy
-		return r.l.session.txFrame(fr, nil)
+		return r.l.session.txFrameAndWait(ctx, fr)
 	}
 }
 
@@ -267,7 +267,7 @@ func (r *Receiver) messageDisposition(ctx context.Context, msg *Message, state e
 		wait = r.inFlight.add(msg.deliveryID)
 	}
 
-	if err := r.sendDisposition(msg.deliveryID, nil, state); err != nil {
+	if err := r.sendDisposition(ctx, msg.deliveryID, nil, state); err != nil {
 		return err
 	}
 
@@ -570,7 +570,7 @@ func (r *Receiver) mux(hooks receiverTestHooks) {
 				Handle: r.l.handle,
 				Closed: true,
 			}
-			_ = r.l.session.txFrame(fr, nil)
+			r.l.session.txFrame(context.Background(), fr, nil)
 
 		case <-r.l.session.done:
 			r.l.doneErr = r.l.session.doneErr
@@ -605,7 +605,7 @@ func (r *Receiver) muxFlow(linkCredit uint32, drain bool) error {
 	}
 
 	select {
-	case r.l.session.tx <- fr:
+	case r.l.session.tx <- frameBodyEnvelope{Ctx: context.Background(), FrameBody: fr}:
 		debug.Log(2, "TX (Receiver %p): mux frame to Session (%p): %d, %s", r, r.l.session, r.l.session.channel, fr)
 		return nil
 	case <-r.l.close:
@@ -649,7 +649,7 @@ func (r *Receiver) muxHandleFrame(fr frames.FrameBody) error {
 		}
 
 		select {
-		case r.l.session.tx <- resp:
+		case r.l.session.tx <- frameBodyEnvelope{Ctx: context.Background(), FrameBody: resp}:
 			debug.Log(2, "TX (Receiver %p): mux frame to Session (%p): %d, %s", r, r.l.session, r.l.session.channel, resp)
 		case <-r.l.close:
 			return nil
