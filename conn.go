@@ -685,7 +685,8 @@ func (c *Conn) readFrame() (frames.Frame, error) {
 			return frames.Frame{}, errors.New("payload too large")
 		}
 
-		bodySize := int64(currentHeader.Size - frames.HeaderSize)
+		extHeaderSize := uint32(currentHeader.DataOffset*4 - 8)
+		bodySize := int64(currentHeader.Size - frames.HeaderSize - extHeaderSize)
 
 		// the full frame hasn't been received, keep reading
 		if int64(c.rxBuf.Len()) < bodySize {
@@ -698,6 +699,10 @@ func (c *Conn) readFrame() (frames.Frame, error) {
 			debug.Log(3, "RX (connReader %p): received keep-alive frame", c)
 			continue
 		}
+
+		// skip over the extended header before parsing the frame
+		// https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#doc-idp124752
+		c.rxBuf.Skip(int(extHeaderSize))
 
 		// parse the frame
 		b, ok := c.rxBuf.Next(bodySize)

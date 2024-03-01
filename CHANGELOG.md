@@ -5,6 +5,7 @@
 ### Bugs Fixed
 
 * Fixed an issue that could cause delays when parsing small frames.
+* Skip any extended header before parsing frames.
 
 ## 1.0.4 (2024-01-16)
 
